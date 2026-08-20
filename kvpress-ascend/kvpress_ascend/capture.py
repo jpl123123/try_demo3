@@ -71,6 +71,7 @@ class CaptureManager:
         self._step_counter = 0
         self._active_prefills = 0
         self._completed_total = 0
+        self._compressed_done: set = set()          # req_ids compressed at completion (no re-trigger)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -110,6 +111,7 @@ class CaptureManager:
             self.row_rewritten.discard(req_id)
             self.mid_anchors.pop(req_id, None)
             self._last_before.pop(req_id, None)
+            self._compressed_done.discard(req_id)
         # recompute/preemption detection by num_computed REGRESSION (a request
         # may legitimately still be prefilling while carrying a mid-prefill
         # layout, so "before < prompt" is no longer a valid drop signal)
@@ -121,7 +123,21 @@ class CaptureManager:
                 self.compact.pop(req_id, None)
                 self.row_rewritten.discard(req_id)
                 self.mid_anchors.pop(req_id, None)
+                self._compressed_done.discard(req_id)
                 registry.record("layout_dropped_recompute")
+        # catch-up: a request that crossed the prefill boundary between steps
+        # WITHOUT the strict check firing (e.g. final-chunk under-count with
+        # MTP async scheduling). last_before < prompt <= before now -> it
+        # completed in the previous step; compress it this step.
+        for req_id in req_ids:
+            before = info.num_computed_before.get(req_id, 0)
+            prompt = info.num_prompt.get(req_id, 0)
+            prev = self._last_before.get(req_id, 0)
+            if (req_id not in info.completed_prefill
+                    and req_id not in self._compressed_done
+                    and prev < prompt <= before):
+                info.completed_prefill.append(req_id)
+                registry.record("completion_caught_up")
         for i, req_id in enumerate(req_ids):
             self._last_before[req_id] = info.num_computed_before.get(req_id, 0)
         attn_state = getattr(runner, "attn_state", None)
@@ -283,11 +299,13 @@ class CaptureManager:
         if delta_t is None or not bool(delta_t.any()):
             return
         num_reqs = info.num_reqs
+        # per-layer metadata seq_lens is a CPU tensor; delta must be CPU too
+        delta_cpu = delta_t.cpu()
         for layer_name, meta in attn_metadata.items():
             seq = getattr(meta, "seq_lens", None)
             if seq is None or seq.shape[0] < num_reqs:
                 continue
-            new_seq = seq[:num_reqs] - delta_t
+            new_seq = seq[:num_reqs] - delta_cpu
             new_seq = new_seq.clamp(min=1)
             meta.seq_lens = new_seq
             meta.seq_lens_cpu = new_seq
@@ -448,6 +466,7 @@ class CaptureManager:
                                          req_id, info.num_prompt.get(req_id, 0), press,
                                          keep_capture=False, kind="completion")
                 self._completed_total += 1
+                self._compressed_done.add(req_id)
             except Exception as exc:  # fail-soft per request
                 registry.record("skipped_error")
                 logger.warning("compress request %s failed: %s", req_id, exc)
@@ -604,19 +623,21 @@ class CaptureManager:
             if n_kept_blocks >= n_blocks:
                 continue
             block_scores, keep_blocks = _block_keep(scores, n_blocks, bs, n_kept_blocks)
-            bl = keep_blocks.numpy() if hasattr(keep_blocks, "numpy") else np.asarray(keep_blocks)
-            bl = bl.astype(np.int64)
+            # keep_blocks/block_scores are DEVICE tensors on the real NPU:
+            # never call .numpy() on them directly (raises "can't convert npu
+            # device type tensor to numpy" - real-machine bug); use _as_numpy.
+            bl = _as_numpy(keep_blocks).astype(np.int64)
             # The last block must stay visible when partial (new tokens land
             # in its padding slots). Make room by dropping the lowest-scored
             # KEPT block when at budget.
             if orig_len % bs != 0 and (m - 1) not in bl.tolist():
-                bscores = block_scores.numpy() if hasattr(block_scores, "numpy") else np.asarray(block_scores)
+                bscores = _as_numpy(block_scores)
                 drop_idx = int(np.argmin(bscores[bl]))
                 bl = np.delete(bl, drop_idx)
                 bl = np.append(bl, m - 1)
                 bl.sort()
             kept_ids = row[bl]
-            n_kept = sum(min(bs, orig_len - b * bs) for b in bl.tolist())
+            n_kept = sum(min(bs, orig_len - int(b) * bs) for b in bl.tolist())
             per_layer[layer_name] = {
                 "kept_ids": kept_ids.astype(np.int64),
                 "n_kept_blocks": int(len(bl)),
@@ -749,6 +770,14 @@ def _attn_state_name(state) -> str:
     if state is None:
         return ""
     return getattr(state, "name", state) if not isinstance(state, str) else state
+
+
+def _as_numpy(t):
+    """Device-safe conversion: tensors may live on npu/cuda and .numpy()
+    raises there - always .cpu() first (real-machine bug, see RTR)."""
+    if torch is not None and torch.is_tensor(t):
+        return t.detach().cpu().numpy()
+    return np.asarray(t)
 
 
 def _qsl_from_meta(meta):

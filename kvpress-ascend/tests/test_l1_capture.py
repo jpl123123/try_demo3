@@ -178,6 +178,52 @@ class TestViewCompressionPass:
         assert "r0" not in mgr.layouts
 
 
+class TestCompletionCatchUp:
+    def test_catch_up_missed_completion(self):
+        """The final prefill chunk can cross the boundary without the strict
+        check firing (MTP async scheduling). The next step must catch up:
+        last_before < prompt <= before -> compress now."""
+        runner = make_runner()
+        ib = FakeInputBatch(["r0"], [100], [260], 16, 256, 16)
+        runner.input_batch = ib
+        mgr = make_mgr()
+        # step A: 100 + 50 < 260 -> not completed
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 50}, 0))
+        assert mgr.step.completed_prefill == []
+        # sample_tokens moves num_computed past the prompt (e.g. 300)
+        ib.num_computed_tokens_cpu[0] = 300
+        # step B: before=300 >= prompt, prev=100 < prompt -> catch-up fires
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 0}, 0))
+        assert mgr.step.completed_prefill == ["r0"]
+        # step C: no re-trigger on later decode steps
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 1}, 0))
+        assert mgr.step.completed_prefill == []
+
+    def test_no_catch_up_for_normal_completion(self):
+        """The strict path handles the normal completion step; the catch-up
+        must not fire on it (before < prompt there)."""
+        runner = make_runner()
+        ib = FakeInputBatch(["r0"], [200], [260], 16, 256, 16)
+        runner.input_batch = ib
+        mgr = make_mgr()
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 60}, 0))
+        assert mgr.step.completed_prefill == ["r0"]
+        ib.num_computed_tokens_cpu[0] = 260
+        mgr._compressed_done.add("r0")
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 1}, 0))
+        assert mgr.step.completed_prefill == []
+
+
+class TestDeviceSafeNumpy:
+    def test_as_numpy(self):
+        from kvpress_ascend.capture import _as_numpy
+        t = torch.tensor([1, 2, 3])
+        out = _as_numpy(t)
+        assert isinstance(out, np.ndarray)
+        assert out.tolist() == [1, 2, 3]
+        assert _as_numpy(np.array([4, 5])).tolist() == [4, 5]
+
+
 class TestMetadataRewrite:
     def test_view_metadata_rewrite(self):
         runner = make_runner()
