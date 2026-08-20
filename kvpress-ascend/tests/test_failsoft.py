@@ -226,3 +226,68 @@ class TestDraftLayerExclusion:
         mgr.on_step_end(runner, FakeSchedulerOutput({"r0": 100}, 0))
         # the only base layer is excluded via the drafter list -> nothing compresses
         assert "r0" not in mgr.layouts
+
+
+class TestBadViewGuard:
+    def test_view_len_out_of_range_drops_layout(self):
+        """A corrupted layout whose view_len exceeds the true length must be
+        dropped before the FIA sees it (real machine: AIV index out of range
+        after ~400 steps of healthy compression)."""
+        runner = FakeRunner().build(num_layers=1, kv_heads=2, head_size=8, num_heads=8,
+                                    block_size=16, max_blocks=256, max_reqs=8)
+        ib = FakeInputBatch(["r0"], [100], [100], 16, 256, 8)
+        runner.input_batch = ib
+        bt = ib.block_table[0]
+        for b in range(7):
+            bt.block_table.np[0, b] = 100 + b
+        bt.num_blocks_per_row[0] = 7
+        from kvpress_ascend.kvcore import ViewLayout
+        mgr = make_mgr()
+        # corrupt layout: n_kept huge -> view_len(101) = 1000 > true_len
+        mgr.layouts["r0"] = {"model.layers.0.self_attn.attn": ViewLayout.build(
+            "r0", "model.layers.0.self_attn.attn", 100, [100, 102], 999, 16)}
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 1}, 0))
+        seq_lens = torch.tensor([101], dtype=torch.int64)
+        from kvpress_ascend.simulate import ATTN_STATES, FakeAscendMetadata
+        meta = {"model.layers.0.self_attn.attn": FakeAscendMetadata(
+            1, [1], ATTN_STATES["DecodeOnly"], seq_lens,
+            bt.get_device_tensor()[:1], torch.zeros(1, dtype=torch.int32))}
+        mgr.on_metadata_built(runner, meta, None)  # must not raise
+        assert "r0" not in mgr.layouts  # dropped
+        # the metadata stays untouched (true view) - nothing bad reaches the FIA
+        assert int(meta["model.layers.0.self_attn.attn"].seq_lens_list[0]) == 101
+        assert registry.stats_snapshot().get("skipped_bad_view", 0) >= 1
+
+    def test_rewrite_failure_restores_metadata(self, monkeypatch):
+        """An exception mid-rewrite must restore the original metadata (no
+        half-rewritten state ever reaches the FIA)."""
+        runner = FakeRunner().build(num_layers=1, kv_heads=2, head_size=8, num_heads=8,
+                                    block_size=16, max_blocks=256, max_reqs=8)
+        ib = FakeInputBatch(["r0"], [100], [100], 16, 256, 8)
+        runner.input_batch = ib
+        bt = ib.block_table[0]
+        for b in range(7):
+            bt.block_table.np[0, b] = 100 + b
+        bt.num_blocks_per_row[0] = 7
+        from kvpress_ascend.kvcore import ViewLayout
+        mgr = make_mgr()
+        mgr.layouts["r0"] = {"model.layers.0.self_attn.attn": ViewLayout.build(
+            "r0", "model.layers.0.self_attn.attn", 100, [100, 102], 30, 16)}
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 1}, 0))
+        seq_lens = torch.tensor([101], dtype=torch.int64)
+        from kvpress_ascend.simulate import ATTN_STATES, FakeAscendMetadata
+        meta = {"model.layers.0.self_attn.attn": FakeAscendMetadata(
+            1, [1], ATTN_STATES["DecodeOnly"], seq_lens,
+            bt.get_device_tensor()[:1], torch.zeros(1, dtype=torch.int32))}
+        # make the layer buffer allocation fail on purpose
+        import kvpress_ascend.capture as cap
+        orig_alloc = cap.CaptureManager._layer_buffer
+        def boom(self, layer_name, shape, device):
+            raise RuntimeError("simulated alloc failure")
+        cap.CaptureManager._layer_buffer = boom
+        try:
+            mgr.on_metadata_built(runner, meta, None)  # must not raise
+        finally:
+            cap.CaptureManager._layer_buffer = orig_alloc
+        m = meta["model.layers.0.self_attn.attn"]
+        assert int(m.seq_lens_list[0]) == 101  # restored, not rewritten

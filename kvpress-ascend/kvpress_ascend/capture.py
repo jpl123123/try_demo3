@@ -351,7 +351,11 @@ class CaptureManager:
             device = true_gpu.device
             num_reqs = info.num_reqs
             # G11 guard: a kept block id outside the KV cache would poison the
-            # FIA's block-table gather on NPU (AIV index out of range).
+            # FIA's block-table gather on NPU (AIV index out of range). Every
+            # anomaly skips the rewrite for that request and drops the layout
+            # so a bad view NEVER reaches the FIA (real machine: deterministic
+            # AIV 'index value ~341k exceeds bounds 923136' after ~400 steps
+            # of healthy compression).
             num_cache_blocks = self._num_cache_blocks_from_runner(runner)
             for layer_name, meta in attn_metadata.items():
                 layer_layouts = {r: l for r in info.req_ids
@@ -361,46 +365,78 @@ class CaptureManager:
                 seq = getattr(meta, "seq_lens", None)
                 if seq is None or seq.shape[0] < num_reqs:
                     continue
-                buf = self._layer_buffer(layer_name, (max(1, meta.block_tables.shape[0]),
-                                                      max_blocks), device)
-                buf.zero_()
-                # copy the true rows (all requests) then overwrite compacted ones
-                n_rows = min(meta.block_tables.shape[0], true_gpu.shape[0])
-                buf[:n_rows] = true_gpu[:n_rows]
-                new_seq = seq[:num_reqs].clone()
-                for req_id, layout in layer_layouts.items():
-                    row_idx = row_map(req_id)
-                    if row_idx is None or row_idx >= n_rows:
-                        continue
-                    if num_cache_blocks and layout.kept_blocks and (
-                            min(layout.kept_blocks) < 0 or max(layout.kept_blocks) >= num_cache_blocks):
-                        registry.record("skipped_bad_row")
-                        logger.warning("req %s kept blocks out of range layer=%s "
-                                       "kept[min=%d max=%d] num_cache_blocks=%d - layout dropped",
-                                       req_id, layer_name, min(layout.kept_blocks),
-                                       max(layout.kept_blocks), num_cache_blocks)
-                        self.layouts.pop(req_id, None)
-                        self.mid_anchors.pop(req_id, None)
-                        continue
-                    kept = torch.as_tensor(layout.kept_blocks, dtype=torch.int32, device=device)
-                    klen = kept.shape[0]
-                    m = layout.m
-                    rest_len = max_blocks - m
-                    if klen > 0:
-                        buf[row_idx, :klen] = kept
-                    if rest_len > 0:
-                        buf[row_idx, klen:klen + rest_len] = true_gpu[row_idx, m:max_blocks]
-                    # seq lens: view len = n_kept + (true - orig)
-                    true_len = int(seq[row_idx].item())
-                    new_seq[row_idx] = layout.view_seq_len(true_len)
-                meta.block_tables = buf
-                meta.seq_lens = new_seq
-                meta.seq_lens_cpu = new_seq
-                lst = new_seq.tolist()
-                n_q = len(getattr(meta, "actual_seq_lengths_q", []) or [])
-                while len(lst) < n_q:
-                    lst.append(1)
-                meta.seq_lens_list = lst
+                # atomic per layer: compute locally, snapshot originals, only
+                # assign at the end; restore on any failure (no half-rewritten
+                # metadata ever reaches the FIA)
+                orig_bt = meta.block_tables
+                orig_seq = meta.seq_lens
+                orig_seq_cpu = meta.seq_lens_cpu
+                orig_list = meta.seq_lens_list
+                try:
+                    buf = self._layer_buffer(layer_name, (max(1, meta.block_tables.shape[0]),
+                                                          max_blocks), device)
+                    buf.zero_()
+                    # copy the true rows (all requests) then overwrite compacted ones
+                    n_rows = min(meta.block_tables.shape[0], true_gpu.shape[0])
+                    buf[:n_rows] = true_gpu[:n_rows]
+                    new_seq = seq[:num_reqs].clone()
+                    for req_id, layout in layer_layouts.items():
+                        row_idx = row_map(req_id)
+                        if row_idx is None or row_idx >= n_rows:
+                            continue
+                        if num_cache_blocks and layout.kept_blocks and (
+                                min(layout.kept_blocks) < 0 or max(layout.kept_blocks) >= num_cache_blocks):
+                            registry.record("skipped_bad_row")
+                            logger.warning("req %s kept blocks out of range layer=%s "
+                                           "kept[min=%d max=%d] num_cache_blocks=%d - layout dropped",
+                                           req_id, layer_name, min(layout.kept_blocks),
+                                           max(layout.kept_blocks), num_cache_blocks)
+                            self.layouts.pop(req_id, None)
+                            self.mid_anchors.pop(req_id, None)
+                            continue
+                        kept = torch.as_tensor(layout.kept_blocks, dtype=torch.int32, device=device)
+                        klen = kept.shape[0]
+                        m = layout.m
+                        rest_len = max_blocks - m
+                        true_len = int(seq[row_idx].item())
+                        view_len = layout.view_seq_len(true_len)
+                        # full self-check before the view reaches the FIA
+                        if m > max_blocks or klen > max_blocks or klen + max(rest_len, 0) > max_blocks:
+                            registry.record("skipped_bad_view")
+                            logger.warning("req %s view layout out of bounds layer=%s m=%d klen=%d "
+                                           "max_blocks=%d - layout dropped",
+                                           req_id, layer_name, m, klen, max_blocks)
+                            self.layouts.pop(req_id, None)
+                            self.mid_anchors.pop(req_id, None)
+                            continue
+                        if not (1 <= view_len <= max(1, true_len)):
+                            registry.record("skipped_bad_view")
+                            logger.warning("req %s view_len out of range layer=%s view_len=%d "
+                                           "true_len=%d - layout dropped",
+                                           req_id, layer_name, view_len, true_len)
+                            self.layouts.pop(req_id, None)
+                            self.mid_anchors.pop(req_id, None)
+                            continue
+                        if klen > 0:
+                            buf[row_idx, :klen] = kept
+                        if rest_len > 0:
+                            buf[row_idx, klen:klen + rest_len] = true_gpu[row_idx, m:max_blocks]
+                        new_seq[row_idx] = view_len
+                    meta.block_tables = buf
+                    meta.seq_lens = new_seq
+                    meta.seq_lens_cpu = new_seq
+                    lst = new_seq.tolist()
+                    n_q = len(getattr(meta, "actual_seq_lengths_q", []) or [])
+                    while len(lst) < n_q:
+                        lst.append(1)
+                    meta.seq_lens_list = lst
+                except Exception as exc:  # restore + fail-soft per layer
+                    registry.record("skipped_error")
+                    logger.warning("layer %s view rewrite failed (restored): %s", layer_name, exc)
+                    meta.block_tables = orig_bt
+                    meta.seq_lens = orig_seq
+                    meta.seq_lens_cpu = orig_seq_cpu
+                    meta.seq_lens_list = orig_list
         except Exception as exc:  # fail-soft
             registry.record("skipped_error")
             logger.warning("view metadata rewrite failed: %s", exc)
@@ -862,7 +898,8 @@ class CaptureManager:
         # visible at a glance instead of an empty stats section.
         stats = registry.stats_snapshot()
         for key in ("compressed", "mid_prefilled", "skipped_short", "skipped_error",
-                    "dry_run", "activation", "layout_dropped_recompute"):
+                    "skipped_bad_row", "skipped_bad_view", "dry_run", "activation",
+                    "layout_dropped_recompute"):
             stats.setdefault(key, 0)
         registry.heartbeat(info.step_id, core, stats=stats)
 
