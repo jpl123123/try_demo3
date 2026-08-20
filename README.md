@@ -105,6 +105,14 @@ vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
 
 完整清单见各包 `README.md`。
 
+## Skill（vllm-ascend 调试方法论，随仓库同步）
+
+`skills/vllm-ascend-debugging/` 是本项目沉淀的完整方法论（与 `.dsh/skills/` 同步更新）：
+- `SKILL.md`：框架先行 → 规划选缝 → 调试状态机 → 无硬件模拟 → 真机排查（通用化，适用于任何 vllm-ascend 模型优化集成）；
+- `references/runtime-scheduling-framework.md`：代码级运行调度框架（进程 → 每步流水线 → 状态时序 → 钩子叠加 → 数据流）；
+- `references/vllm-ascend-v023-seam-map.md`：v0.23.0 已验证 seam/API 表 + 压缩布局公式；
+- `references/bug-catalog.md`：实战 bug 目录（29 条，含琐碎项）。
+
 ## 机制一句话
 
 - **kvpress**：prefill 完成瞬间按层打分（head 统一）→ 块粒度保留集 → 每步只重写 `attn_metadata[layer]` 的 `block_tables` 视图行与 `seq_lens`（写路径零改动 → 前缀缓存 hash 有效、MTP 兼容）。
