@@ -76,11 +76,12 @@ vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
 每个 `execute_model` 步两个包各打一行，证明 patch 进了核心代码（seam 探针）与核心参数：
 
 ```
-[kvpress-ascend]  INFO step=42 seams=6/8 press=snapkv ratio=0.50 window=64 sink=4 mode=view layers=4 active_compressed=2 attn_state=DecodeOnly compressed=3 ...
-[squeeze-ascend]  INFO step=42 seams=6/6 ini=0.30 class3=0.10 start=4 w_min=512 w_max=65536 clustered=2 ...
+[kvpress-ascend]  INFO step=42 seams=8/8 hit=8 press=snapkv ratio=0.50 window=64 sink=4 mode=view layers=4 prefilling=0 completed=1 active_compressed=2 mid_anchored=3 attn_state=DecodeOnly compressed=12 mid_prefilled=3 skipped_short=0 skipped_error=0 dry_run=0 activation=1
+[squeeze-ascend]  INFO step=42 seams=6/6 hit=6 ini=0.30 class3=0.10 start=4 w_min=512 w_max=65536 prefilling=0 completed=1 attn_state=DecodeOnly clustered=2 skipped_short=0 skipped_error=0 activation=1
 ```
 
-- `seams=x/N`：本步命中的钩子数；`FAIL=...` 点名未安装的钩子 → patch 没进核心代码，先查 `[kvpress-ascend]`/`[squeeze-ascend]` 错误日志。
+- `seams=installed/total`（无 `FAIL=` 即全部钩子装上）；`hit=N` 是至少触发过一次的钩子数。
+- 关键计数器**恒显**（带零值）：`compressed / mid_prefilled / skipped_short / skipped_error / dry_run / activation`——`compressed=0` 且无 skipped 增长 = 优化没触发，先查 `[kvpress-ascend]` 错误日志或开 `KVPRESS_ASCEND_LOG=debug`。
 - 激活时每个进程打印一次全 seam 汇总。
 - 关闭心跳：`export KVPRESS_ASCEND_STEP_LOG=0` / `export SQUEEZE_ASCEND_STEP_LOG=0`；日志级别：`KVPRESS_ASCEND_LOG=debug|info|warning`（squeeze 同理）。
 
@@ -92,6 +93,10 @@ vllm serve /softwarePlatform/c00879303/Qwen3.5-27B-w8a8-mtp \
 | 压缩比例 | `KVPRESS_ASCEND_RATIO` | `0.5` | 保留比例 = 1−ratio |
 | 观察窗口 | `KVPRESS_ASCEND_WINDOW` | `64` | SnapKV/TOVA 用 |
 | 布局模式 | `KVPRESS_ASCEND_MODE` | `view` | `view`（默认，前缀缓存安全）或 `compact`（物理搬移，需 `KVPRESS_ASCEND_PREFIX_CACHE=force`） |
+| **长上下文渐进压缩** | `KVPRESS_ASCEND_MID_PREFILL` | `0` | **=1 开启 mid-prefill 渐进压缩**（view 模式）：解决"KV 显存在任何请求完成前就耗尽 → 压缩永不触发"的鸡生蛋问题，262144 级长 prompt 必开 |
+| 首个压缩锚点 | `KVPRESS_ASCEND_MID_PREFILL_BUDGET` | `65536` | 每请求 prefill 途中达到该 token 数时执行第一次压缩 |
+| 压缩刷新间隔 | `KVPRESS_ASCEND_MID_PREFILL_REFRESH` | `32768` | 锚点之后每再增长这么多 token 重新压缩一次（推进锚点） |
+| 进度摘要 | `KVPRESS_ASCEND_PROGRESS_LOG` | `200` | 每 N 步打印 prefill 进度（`min/max remaining`、完成数），排查"永远不完成"（0=关） |
 | 安全排练 | `KVPRESS_ASCEND_DRY_RUN` | `0` | 只打分不生效，先确认统计正常 |
 | 总预算比例 | `SQUEEZE_ASCEND_INI_SIZE` | `0.3` | 总 KV 预算 = 层数 × ini × prompt 长 |
 | class-3 窗口 | `SQUEEZE_ASCEND_CLASS3_RATIO` | `0.1` | 高 cos 相似层的窗口比例 |

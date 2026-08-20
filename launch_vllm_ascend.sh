@@ -22,6 +22,13 @@ export squeeze=1        # 开启 SqueezeAttention（同开时默认让位给 kvp
 # export KVPRESS_ASCEND_MODE=view           # view（默认）| compact
 # export KVPRESS_ASCEND_STEP_LOG=1
 # export KVPRESS_ASCEND_LOG=info
+#
+# ---- 262144 级长上下文必开：渐进式 mid-prefill 压缩 ----
+# export KVPRESS_ASCEND_MID_PREFILL=1
+# export KVPRESS_ASCEND_MID_PREFILL_BUDGET=65536     # 首个压缩锚点（每请求 token 数）
+# export KVPRESS_ASCEND_MID_PREFILL_REFRESH=32768    # 锚点后每再增长多少 token 压一次
+# export KVPRESS_ASCEND_PROGRESS_LOG=200             # 每 N 步打印 prefill 进度摘要（0=关）
+#
 # export SQUEEZE_ASCEND_INI_SIZE=0.3
 # export SQUEEZE_ASCEND_CLASS3_RATIO=0.1
 # export SQUEEZE_ASCEND_START_SIZE=4
