@@ -63,13 +63,29 @@ class TestStepBegin:
         assert mgr.step.completed_prefill == ["r0"]  # 200+60 >= 260
 
     def test_layout_dropped_on_recompute(self):
+        """Preemption detection is now regression-based (before < last_seen):
+        a request may legitimately carry a mid-prefill layout while still
+        prefilling, so 'before < prompt' alone is no longer a drop signal."""
         runner = make_runner()
         ib = FakeInputBatch(["r0"], [100], [260], 16, 256, 16)
         runner.input_batch = ib
         mgr = make_mgr()
         mgr.layouts["r0"] = {"l0": object()}
+        mgr._last_before["r0"] = 200  # num_computed fell back -> preemption
         mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 50}, 0))
         assert "r0" not in mgr.layouts
+
+    def test_layout_survives_still_prefilling(self):
+        """A mid-prefill layout must NOT be dropped while the request keeps
+        prefilling normally (monotonic num_computed)."""
+        runner = make_runner()
+        ib = FakeInputBatch(["r0"], [150], [260], 16, 256, 16)
+        runner.input_batch = ib
+        mgr = make_mgr()
+        mgr.layouts["r0"] = {"l0": object()}
+        mgr._last_before["r0"] = 100  # progressed 100 -> 150: normal
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        assert "r0" in mgr.layouts
 
 
 class TestCapture:

@@ -33,11 +33,14 @@ def mark_hit(name: str) -> None:
 
 
 def seams_summary() -> str:
+    """`seams=installed/total hit=... FAIL=...` — installed is the actionable
+    number; hit counts seams that fired at least once."""
     with _lock:
+        total = len(SEAMS)
         installed = sum(1 for s in SEAMS.values() if s["installed"])
         hit = sum(1 for s in SEAMS.values() if s["hit"])
         failed = [n for n, s in SEAMS.items() if not s["installed"]]
-        parts = [f"seams={hit}/{len(SEAMS)}"]
+        parts = [f"seams={installed}/{total}", f"hit={hit}"]
         if failed:
             parts.append("FAIL=" + ",".join(failed))
         return " ".join(parts)

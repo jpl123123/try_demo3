@@ -13,6 +13,7 @@ Data flow per step (see PLAN.md §2.3):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from kvpress_ascend import envs, registry
@@ -60,6 +61,8 @@ class CaptureManager:
         self.layouts: dict[str, dict] = {}          # req_id -> {layer_name: ViewLayout|CompactLayout}
         self.compact: dict[str, "object"] = {}      # req_id -> CompactLayout (compact mode)
         self.row_rewritten: set = set()             # req_ids whose np row is already permuted
+        self.mid_anchors: dict[str, int] = {}       # req_id -> current mid-prefill anchor (view mode)
+        self._last_before: dict[str, int] = {}      # req_id -> num_computed seen last step (drop detection)
         self.capture_w = 0
         self.buffers: dict = {}                     # per-layer view-row device buffers
         self.press = None
@@ -67,6 +70,7 @@ class CaptureManager:
         self.step: StepInfo | None = None
         self._step_counter = 0
         self._active_prefills = 0
+        self._completed_total = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -104,16 +108,22 @@ class CaptureManager:
             self.layouts.pop(req_id, None)
             self.compact.pop(req_id, None)
             self.row_rewritten.discard(req_id)
-        # recompute detection: a tracked request whose num_computed fell back
-        # below its prompt length lost its KV (preemption) -> drop layout
+            self.mid_anchors.pop(req_id, None)
+            self._last_before.pop(req_id, None)
+        # recompute/preemption detection by num_computed REGRESSION (a request
+        # may legitimately still be prefilling while carrying a mid-prefill
+        # layout, so "before < prompt" is no longer a valid drop signal)
         for req_id in list(self.layouts):
             before = info.num_computed_before.get(req_id, 0)
-            prompt = info.num_prompt.get(req_id, 0)
-            if prompt and before < prompt:
+            prev = self._last_before.get(req_id, 0)
+            if before < prev:
                 self.layouts.pop(req_id, None)
                 self.compact.pop(req_id, None)
                 self.row_rewritten.discard(req_id)
+                self.mid_anchors.pop(req_id, None)
                 registry.record("layout_dropped_recompute")
+        for i, req_id in enumerate(req_ids):
+            self._last_before[req_id] = info.num_computed_before.get(req_id, 0)
         attn_state = getattr(runner, "attn_state", None)
         info.attn_state_name = _attn_state_name(attn_state)
         self._active_prefills = sum(
@@ -122,6 +132,13 @@ class CaptureManager:
         )
         self.step = info
         registry.mark_hit("S5_execute_model")
+        if logger.isEnabledFor(logging.DEBUG):
+            dbg = [(r, info.num_computed_before.get(r, 0),
+                    info.num_scheduled.get(r, 0), info.num_prompt.get(r, 0))
+                   for r in req_ids[:3]]
+            logger.debug("step %d reqs=%d prefill=%d completed=%s sample=%s",
+                         step_id, len(req_ids), self._active_prefills,
+                         info.completed_prefill, dbg)
 
     def on_prepare_inputs_entry(self, runner) -> None:
         """Compact mode: idempotent row permutation before commit_block_table."""
@@ -374,6 +391,9 @@ class CaptureManager:
         try:
             if info.completed_prefill:
                 self._compress_completed_prefills(runner, info)
+            else:
+                self._maybe_mid_prefill(runner, info)
+            self._progress_summary(info)
             self._heartbeat(runner)
         except Exception as exc:  # fail-soft
             registry.record("skipped_error")
@@ -423,12 +443,78 @@ class CaptureManager:
         num_hidden_layers = self._num_hidden_layers(runner)
         for req_id in info.completed_prefill:
             try:
-                self._compress_one(runner, sfc, ib, bt, row_map, layer_names, bs,
-                                   kv_heads, head_size, num_heads, num_hidden_layers,
-                                   req_id, info, press)
+                self._compress_at_length(runner, sfc, ib, bt, row_map, layer_names, bs,
+                                         kv_heads, head_size, num_heads, num_hidden_layers,
+                                         req_id, info.num_prompt.get(req_id, 0), press,
+                                         keep_capture=False, kind="completion")
+                self._completed_total += 1
             except Exception as exc:  # fail-soft per request
                 registry.record("skipped_error")
                 logger.warning("compress request %s failed: %s", req_id, exc)
+
+    def _maybe_mid_prefill(self, runner, info: StepInfo) -> None:
+        """Progressive compression during chunked prefill (view mode only).
+
+        Fixes the chicken-and-egg of the completion-only design: with very long
+        prompts the KV cache can fill up before ANY request finishes prefilling
+        (preemption loop, `completed=0` forever). Mid-prefill compression
+        anchors the layout at the current true length and re-compresses every
+        `refresh` tokens.
+        """
+        if self.mode != "view" or not envs.mid_prefill() or not info.req_ids:
+            return
+        if self.press is None or envs.dry_run():
+            return
+        sfc = getattr(runner, "compilation_config", None)
+        sfc = getattr(getattr(runner, "vllm_config", None), "compilation_config", None) or sfc
+        sfc = getattr(sfc, "static_forward_context", None) if sfc is not None else None
+        if sfc is None:
+            sfc = getattr(runner, "static_forward_context", None)
+        kvcc = getattr(runner, "kv_cache_config", None)
+        ib = getattr(runner, "input_batch", None)
+        if kvcc is None or sfc is None or ib is None:
+            return
+        try:
+            group0 = kvcc.kv_cache_groups[0]
+            spec = group0.kv_cache_spec
+            bs = int(getattr(spec, "block_size", 128) or 128)
+            kv_heads = int(getattr(spec, "num_kv_heads", 0) or 0)
+            head_size = int(getattr(spec, "head_size", 0) or 0)
+            layer_names = list(group0.layer_names)
+        except Exception as exc:
+            registry.record("skipped_error")
+            logger.warning("cannot read kv_cache_spec: %s", exc)
+            return
+        row_map = getattr(getattr(ib, "req_id_to_index", None), "get", None)
+        bt = getattr(ib, "block_table", None)
+        if row_map is None or bt is None or not layer_names:
+            return
+        num_heads = self._num_heads(runner, layer_names[0], kv_heads)
+        num_hidden_layers = self._num_hidden_layers(runner)
+        budget = max(1, envs.mid_prefill_budget())
+        refresh = max(1, envs.mid_prefill_refresh())
+        for req_id in info.req_ids:
+            before = info.num_computed_before.get(req_id, 0)
+            prompt = info.num_prompt.get(req_id, 0)
+            n_sched = info.num_scheduled.get(req_id, 0)
+            if not (before < prompt and before + n_sched >= budget):
+                continue
+            true_len = before + n_sched
+            anchor = self.mid_anchors.get(req_id, 0)
+            if anchor > 0 and true_len - anchor < refresh:
+                continue
+            if true_len < envs.min_prompt_tokens():
+                continue
+            try:
+                self._compress_at_length(runner, sfc, ib, bt, row_map, layer_names, bs,
+                                         kv_heads, head_size, num_heads, num_hidden_layers,
+                                         req_id, true_len, self.press,
+                                         keep_capture=True, kind="mid")
+                self.mid_anchors[req_id] = true_len
+                registry.record("mid_prefilled")
+            except Exception as exc:  # fail-soft per request
+                registry.record("skipped_error")
+                logger.warning("mid-prefill compress %s failed: %s", req_id, exc)
 
     def _num_hidden_layers(self, runner) -> int:
         try:
@@ -454,13 +540,19 @@ class CaptureManager:
             pass
         return kv_heads * 4  # unknown fallback (GQA=4 default guess)
 
-    def _compress_one(self, runner, sfc, ib, bt, row_map, layer_names, bs,
-                      kv_heads, head_size, num_heads, num_hidden_layers,
-                      req_id, info, press) -> None:
+    def _compress_at_length(self, runner, sfc, ib, bt, row_map, layer_names, bs,
+                            kv_heads, head_size, num_heads, num_hidden_layers,
+                            req_id, anchor_len, press, keep_capture=False,
+                            kind="completion") -> None:
+        """Score + record layout anchored at `anchor_len` true tokens.
+
+        kind="completion": anchor == prompt length (request done prefilling).
+        kind="mid": anchor < prompt length (progressive compression, view mode).
+        """
         row_idx = row_map(req_id)
         if row_idx is None:
             return
-        orig_len = info.num_prompt.get(req_id, 0)
+        orig_len = int(anchor_len)
         if orig_len < envs.min_prompt_tokens():
             registry.record("skipped_short")
             return
@@ -479,13 +571,16 @@ class CaptureManager:
         rc = self.requests.get(req_id)
         if self.mode == "view":
             self._score_and_record_view(sfc, layer_names, bs, kv_heads, head_size, num_heads,
-                                        num_hidden_layers, req_id, orig_len, m, slot_t, rc, press, device, row)
+                                        num_hidden_layers, req_id, orig_len, m, slot_t, rc,
+                                        press, device, row, keep_capture=keep_capture, kind=kind)
         else:
             self._score_and_record_compact(sfc, layer_names, bs, kv_heads, head_size, num_heads,
-                                           num_hidden_layers, req_id, orig_len, m, slot_t, rc, press, device, row)
+                                           num_hidden_layers, req_id, orig_len, m, slot_t, rc,
+                                           press, device, row)
 
     def _score_and_record_view(self, sfc, layer_names, bs, kv_heads, head_size, num_heads,
-                               num_hidden_layers, req_id, orig_len, m, slot_t, rc, press, device, row) -> None:
+                               num_hidden_layers, req_id, orig_len, m, slot_t, rc, press,
+                               device, row, keep_capture=False, kind="completion") -> None:
         per_layer: dict = {}
         for layer_name in layer_names:
             mod = sfc.get(layer_name)
@@ -511,9 +606,9 @@ class CaptureManager:
             block_scores, keep_blocks = _block_keep(scores, n_blocks, bs, n_kept_blocks)
             bl = keep_blocks.numpy() if hasattr(keep_blocks, "numpy") else np.asarray(keep_blocks)
             bl = bl.astype(np.int64)
-            # The prompt's last block must stay visible when partial (new
-            # tokens land in its padding slots). Make room by dropping the
-            # lowest-scored KEPT block when at budget.
+            # The last block must stay visible when partial (new tokens land
+            # in its padding slots). Make room by dropping the lowest-scored
+            # KEPT block when at budget.
             if orig_len % bs != 0 and (m - 1) not in bl.tolist():
                 bscores = block_scores.numpy() if hasattr(block_scores, "numpy") else np.asarray(block_scores)
                 drop_idx = int(np.argmin(bscores[bl]))
@@ -538,9 +633,11 @@ class CaptureManager:
         for layer_name, pl in per_layer.items():
             layouts[layer_name] = ViewLayout.build(
                 req_id, layer_name, orig_len, pl["kept_ids"], pl["n_kept"], bs)
-        logger.debug("req %s compressed: layers=%d (view mode)", req_id, len(per_layer))
-        # free captured buffers of this request (keep layout only)
-        self.requests.pop(req_id, None)
+        logger.debug("req %s %s-compressed: layers=%d anchor=%d (view mode)",
+                     req_id, kind, len(per_layer), orig_len)
+        # free captured buffers of this request unless mid-prefill needs them
+        if not keep_capture:
+            self.requests.pop(req_id, None)
 
     def _score_and_record_compact(self, sfc, layer_names, bs, kv_heads, head_size, num_heads,
                                   num_hidden_layers, req_id, orig_len, m, slot_t, rc, press, device, row) -> None:
@@ -597,6 +694,23 @@ class CaptureManager:
         logger.debug("req %s compacted: orig=%d kept=%d k=%d slack=%d",
                      req_id, orig_len, n_kept, layout.k, layout.slack)
 
+    def _progress_summary(self, info: StepInfo) -> None:
+        """Periodic INFO summary so a stuck/never-completing prefill phase is
+        visible without debug logs."""
+        interval = envs.progress_log_interval()
+        if interval <= 0 or not info.req_ids or info.step_id % interval != 0:
+            return
+        prefilling = [r for r in info.req_ids
+                      if info.num_computed_before.get(r, 0) < info.num_prompt.get(r, 0)]
+        remaining = [info.num_prompt.get(r, 0) - info.num_computed_before.get(r, 0)
+                     for r in prefilling]
+        logger.info("progress: step=%d reqs=%d prefilling=%d completed_total=%d "
+                    "min_remaining=%s max_remaining=%s mid_anchored=%d",
+                    info.step_id, len(info.req_ids), len(prefilling), self._completed_total,
+                    min(remaining) if remaining else 0,
+                    max(remaining) if remaining else 0,
+                    len(self.mid_anchors))
+
     def _heartbeat(self, runner) -> None:
         info = self.step
         if info is None:
@@ -611,11 +725,19 @@ class CaptureManager:
             "sink": getattr(self.press, "n_sink", envs.sink_size()) if self.press else envs.sink_size(),
             "mode": self.mode,
             "layers": layer_count,
+            "prefilling": self._active_prefills,
             "completed": len(info.completed_prefill),
             "active_compressed": len(self.layouts),
+            "mid_anchored": len(self.mid_anchors),
             "attn_state": info.attn_state_name,
         }
-        registry.heartbeat(info.step_id, core, stats=registry.stats_snapshot())
+        # Always show the key counters (with zeros) so "nothing happened" is
+        # visible at a glance instead of an empty stats section.
+        stats = registry.stats_snapshot()
+        for key in ("compressed", "mid_prefilled", "skipped_short", "skipped_error",
+                    "dry_run", "activation", "layout_dropped_recompute"):
+            stats.setdefault(key, 0)
+        registry.heartbeat(info.step_id, core, stats=stats)
 
 
 # ---------------------------------------------------------------------------

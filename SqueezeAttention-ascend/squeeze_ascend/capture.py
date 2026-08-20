@@ -316,10 +316,18 @@ class WindowManager:
             "w_min": min(w) if w else 0,
             "w_max": max(w) if w else 0,
             "active_windowed": len(self.windows),
+            "prefilling": sum(1 for r in info.req_ids
+                              if info.num_computed_before.get(r, 0) < info.num_prompt.get(r, 0)),
             "completed": len(info.completed_prefill),
             "attn_state": info.attn_state_name,
         }
-        registry.heartbeat(info.step_id, core, stats=registry.stats_snapshot())
+        # Always show the key counters (with zeros) so "nothing happened" is
+        # visible at a glance.
+        stats = registry.stats_snapshot()
+        for key in ("clustered", "skipped_short", "skipped_error",
+                    "dry_run", "activation", "window_dropped_recompute"):
+            stats.setdefault(key, 0)
+        registry.heartbeat(info.step_id, core, stats=stats)
 
 
 # ---------------------------------------------------------------------------

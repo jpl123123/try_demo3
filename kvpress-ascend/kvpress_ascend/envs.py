@@ -105,6 +105,32 @@ def skip_draft_steps() -> bool:
     return _truthy(os.environ.get("KVPRESS_ASCEND_SKIP_DRAFT_STEPS"), False)
 
 
+def mid_prefill() -> bool:
+    """KVPRESS_ASCEND_MID_PREFILL: compress DURING chunked prefill (view mode
+    only), not only at prefill completion. Required for very long prompts whose
+    KV fills the cache before any request finishes prefilling (the
+    chicken-and-egg of the completion-only design). Default off."""
+    return _truthy(os.environ.get("KVPRESS_ASCEND_MID_PREFILL"), False)
+
+
+def mid_prefill_budget() -> int:
+    """KVPRESS_ASCEND_MID_PREFILL_BUDGET: first mid-prefill compression anchor
+    (tokens per request). Default 65536."""
+    return _int(os.environ.get("KVPRESS_ASCEND_MID_PREFILL_BUDGET"), 65536)
+
+
+def mid_prefill_refresh() -> int:
+    """KVPRESS_ASCEND_MID_PREFILL_REFRESH: re-compress every N tokens past the
+    current anchor. Default 32768 (budget/2)."""
+    return _int(os.environ.get("KVPRESS_ASCEND_MID_PREFILL_REFRESH"), 32768)
+
+
+def progress_log_interval() -> int:
+    """KVPRESS_ASCEND_PROGRESS_LOG: periodic prefill-progress summary every N
+    steps (0 disables). Default 200."""
+    return _int(os.environ.get("KVPRESS_ASCEND_PROGRESS_LOG"), 200)
+
+
 def expected_attention_future_positions() -> int:
     """KVPRESS_ASCEND_EA_FUTURE: ExpectedAttention n_future_positions (default 512)."""
     return _int(os.environ.get("KVPRESS_ASCEND_EA_FUTURE"), 512)

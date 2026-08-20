@@ -125,9 +125,13 @@ def install() -> bool:
         results.append(_wrap("S5_execute_model", NPUModelRunner, "execute_model", _exec_model))
         results.append(_wrap("S3_prepare_inputs", NPUModelRunner, "_prepare_inputs", _prepare_inputs))
         results.append(_wrap("S4_attn_metadata", NPUModelRunner, "_build_attention_metadata", _build_attn_meta))
+        # S6 is a logical seam (the compression pass lives inside the S5 hooks):
+        # mark it installed together with S5 so the heartbeat never reports a
+        # false FAIL.
+        registry.mark_installed("S6_compress_pass")
     except Exception as exc:  # noqa: BLE001
         logger.error("model runner import failed: %s", exc)
-        for name in ("S5_execute_model", "S3_prepare_inputs", "S4_attn_metadata"):
+        for name in ("S5_execute_model", "S3_prepare_inputs", "S4_attn_metadata", "S6_compress_pass"):
             registry.mark_installed(name, ok=False)
 
     # ---- S1: attention backend forward (query capture) -------------------
@@ -181,6 +185,7 @@ def install() -> bool:
         from vllm_ascend.worker.block_table import MultiGroupBlockTable
 
         def _compute_slot_mapping(orig, self, num_reqs, query_start_loc, positions, *args, **kwargs):
+            registry.mark_hit("S7_slot_mapping")
             try:
                 if ctx.mode == "compact":
                     _shift_positions(num_reqs, query_start_loc, positions)

@@ -101,10 +101,16 @@ def install() -> bool:
 
         results.append(_wrap("S1_step_begin", NPUModelRunner, "execute_model", _exec_model))
         results.append(_wrap("S4_metadata", NPUModelRunner, "_build_attention_metadata", _build_attn_meta))
+        # S5_cluster / S6_step_end are logical seams inside the S1 hooks: mark
+        # them installed together with S1 so the heartbeat never false-FAILs.
+        registry.mark_installed("S5_cluster")
+        registry.mark_installed("S6_step_end")
     except Exception as exc:  # noqa: BLE001
         logger.error("model runner import failed: %s", exc)
         registry.mark_installed("S1_step_begin", ok=False)
         registry.mark_installed("S4_metadata", ok=False)
+        registry.mark_installed("S5_cluster", ok=False)
+        registry.mark_installed("S6_step_end", ok=False)
 
     # S3: Attention module class-level wrapper (attn output capture)
     try:

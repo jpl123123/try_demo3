@@ -45,6 +45,10 @@ export kvpress=1                       # 主开关（等价: kvpress_ascend=1 / 
 | `KVPRESS_ASCEND_LOG` | `info` | 日志级别 |
 | `KVPRESS_ASCEND_POLICY` | `both` | `squeeze` 时本包让位 |
 | `KVPRESS_ASCEND_SKIP_DRAFT_STEPS` | `0` | 有 draft token 的步跳过视图重写（保守） |
+| `KVPRESS_ASCEND_MID_PREFILL` | `0` | **长上下文渐进压缩**（view 模式）：prefill 途中按预算压缩，解决"KV 显存在任何请求完成前就耗尽 → 优化永不触发"的鸡生蛋问题 |
+| `KVPRESS_ASCEND_MID_PREFILL_BUDGET` | `65536` | 首个渐进压缩锚点（每请求 token 数） |
+| `KVPRESS_ASCEND_MID_PREFILL_REFRESH` | `32768` | 锚点之后每增长多少 token 再压缩一次 |
+| `KVPRESS_ASCEND_PROGRESS_LOG` | `200` | 每 N 步打印 prefill 进度摘要（`0` 关闭），排查"永远不完成" |
 
 ## 机制（与上游 kvpress 的差异，务必阅读）
 
