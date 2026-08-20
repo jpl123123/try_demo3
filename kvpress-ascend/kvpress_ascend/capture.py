@@ -349,6 +349,9 @@ class CaptureManager:
             max_blocks = true_gpu.shape[1]
             device = true_gpu.device
             num_reqs = info.num_reqs
+            # G11 guard: a kept block id outside the KV cache would poison the
+            # FIA's block-table gather on NPU (AIV index out of range).
+            num_cache_blocks = self._num_cache_blocks_from_runner(runner)
             for layer_name, meta in attn_metadata.items():
                 layer_layouts = {r: l for r in info.req_ids
                                  for l in [self.layouts.get(r, {}).get(layer_name)] if l is not None}
@@ -367,6 +370,16 @@ class CaptureManager:
                 for req_id, layout in layer_layouts.items():
                     row_idx = row_map(req_id)
                     if row_idx is None or row_idx >= n_rows:
+                        continue
+                    if num_cache_blocks and layout.kept_blocks and (
+                            min(layout.kept_blocks) < 0 or max(layout.kept_blocks) >= num_cache_blocks):
+                        registry.record("skipped_bad_row")
+                        logger.warning("req %s kept blocks out of range layer=%s "
+                                       "kept[min=%d max=%d] num_cache_blocks=%d - layout dropped",
+                                       req_id, layer_name, min(layout.kept_blocks),
+                                       max(layout.kept_blocks), num_cache_blocks)
+                        self.layouts.pop(req_id, None)
+                        self.mid_anchors.pop(req_id, None)
                         continue
                     kept = torch.as_tensor(layout.kept_blocks, dtype=torch.int32, device=device)
                     klen = kept.shape[0]
@@ -548,6 +561,32 @@ class CaptureManager:
             pass
         return 0
 
+    def _num_cache_blocks(self, sfc, layer_names) -> int:
+        """Number of KV cache blocks per layer (from the bound KV cache)."""
+        try:
+            for layer_name in layer_names:
+                mod = sfc.get(layer_name)
+                if mod is not None:
+                    kc = getattr(mod, "kv_cache", None)
+                    if kc and kc[0] is not None:
+                        return int(kc[0].shape[0])
+        except Exception:
+            pass
+        return 0
+
+    def _num_cache_blocks_from_runner(self, runner) -> int:
+        try:
+            sfc = getattr(runner, "compilation_config", None)
+            sfc = getattr(sfc, "static_forward_context", None)
+            if sfc:
+                for mod in sfc.values():
+                    kc = getattr(mod, "kv_cache", None)
+                    if kc and kc[0] is not None:
+                        return int(kc[0].shape[0])
+        except Exception:
+            pass
+        return 0
+
     def _num_heads(self, runner, layer_name: str, kv_heads: int) -> int:
         try:
             mod = runner.compilation_config.static_forward_context.get(layer_name)
@@ -580,12 +619,30 @@ class CaptureManager:
         if row.shape[0] < m or int(row[m - 1]) == 0:
             registry.record("skipped_error")
             return
+        # G11 guard: validate the row and the derived slots on CPU BEFORE any
+        # device gather. A bad block id would reach the NPU gather kernel and
+        # poison the device stream (Python try/except cannot recover; the
+        # worker crashes at the next sync point). Real-machine: AIV
+        # "Index out of range ... index value 341748 exceeds bounds 923136".
+        num_blocks = self._num_cache_blocks(sfc, layer_names)
+        if num_blocks:
+            if int(row.min()) < 0 or int(row.max()) >= num_blocks:
+                registry.record("skipped_bad_row")
+                logger.warning("req %s bad block row anchor=%d m=%d ids[min=%d max=%d] "
+                               "num_blocks=%d - skipped (G11 guard)",
+                               req_id, orig_len, m, int(row.min()), int(row.max()), num_blocks)
+                return
         device = runner.device
         # slots of the TRUE positions 0..orig_len-1 ONLY (never include the
         # last block's padding: scores must not be polluted by padding KV)
         slots = np.arange(orig_len, dtype=np.int64)
         block_ids = np.repeat(row, bs)[:orig_len]
         slots = block_ids * bs + (slots % bs)
+        if num_blocks and int(slots.max()) >= num_blocks * bs:
+            registry.record("skipped_bad_row")
+            logger.warning("req %s slot overflow anchor=%d max_slot=%d num_slots=%d - skipped (G11 guard)",
+                           req_id, orig_len, int(slots.max()), num_blocks * bs)
+            return
         slot_t = torch.from_numpy(slots.astype(np.int64)).to(device)
         rc = self.requests.get(req_id)
         if self.mode == "view":
