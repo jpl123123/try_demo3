@@ -47,13 +47,20 @@ def _wrap(name: str, obj, attr: str, fn) -> bool:
         return False
 
 
+# Set by install() when the package deliberately defers to another package
+# (not an installation failure). Read by apply() to pick the right log level.
+DEFERRED_REASON: str | None = None
+
+
 def install() -> bool:
-    global ctx
+    global ctx, DEFERRED_REASON
+    DEFERRED_REASON = None
     # When both packages are enabled, kvpress wins by default; the user can
     # force this package with SQUEEZE_ASCEND_POLICY=squeeze.
     try:
         import kvpress_ascend as _kvp
         if _kvp.is_enabled() and envs.policy() != "squeeze":
+            DEFERRED_REASON = "kvpress-ascend is enabled and SQUEEZE_ASCEND_POLICY != 'squeeze'"
             logger.warning("kvpress-ascend is enabled too: SqueezeAttention-ascend defers "
                            "(set SQUEEZE_ASCEND_POLICY=squeeze to force)")
             return False

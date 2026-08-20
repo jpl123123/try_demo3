@@ -48,7 +48,7 @@ def apply() -> bool:
     from kvpress_ascend.engine import install
 
     if not is_enabled():
-        log.logger.info("kvpress-ascend not activated (export kvpress=1 to enable) — no patches installed")
+        log.logger.info("kvpress-ascend not activated (export kvpress=1 to enable) - no patches installed")
         return False
 
     log.logger.info("kvpress-ascend activated, installing monkeypatches (vllm-ascend v0.23.0 adapter)")
@@ -59,10 +59,16 @@ def apply() -> bool:
         registry.record("activation_error", str(exc))
         return False
 
+    from kvpress_ascend.engine import DEFERRED_REASON
+
     if ok:
         registry.log_activation_summary()
+    elif DEFERRED_REASON:
+        # Deliberate deferral (KVPRESS_ASCEND_POLICY=squeeze): NOT an error.
+        log.logger.info("deferred: %s (expected, no patches installed)", DEFERRED_REASON)
     else:
-        log.logger.error("kvpress-ascend installed with FAILED seams — see seam summary above")
+        registry.log_activation_summary()
+        log.logger.error("kvpress-ascend installed with FAILED seams - see summary above")
     return ok
 
 

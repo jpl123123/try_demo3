@@ -52,10 +52,17 @@ def _wrap(name: str, obj, attr: str, fn) -> bool:
         return False
 
 
+# Set by install() when the package deliberately defers to another package
+# (not an installation failure). Read by apply() to pick the right log level.
+DEFERRED_REASON: str | None = None
+
+
 def install() -> bool:
     """Import targets and apply every seam. Returns True if all seams OK."""
-    global ctx
+    global ctx, DEFERRED_REASON
+    DEFERRED_REASON = None
     if envs.policy() == "squeeze":
+        DEFERRED_REASON = "KVPRESS_ASCEND_POLICY == 'squeeze'"
         logger.warning("KVPRESS_ASCEND_POLICY=squeeze -> kvpress-ascend defers to SqueezeAttention-ascend, "
                        "no patches installed")
         return False
