@@ -175,3 +175,54 @@ class TestFailSoft:
         mgr.on_metadata_built(runner, meta, None)  # must not raise
         assert "r0" not in mgr.layouts  # layout dropped
         assert int(meta["model.layers.0.self_attn.attn"].seq_lens_list[0]) == 101  # untouched
+
+
+class TestDraftLayerExclusion:
+    def test_is_draft_layer_name(self):
+        from kvpress_ascend.capture import _is_draft_layer_name
+        assert _is_draft_layer_name("mtp.layers.0.self_attn.attn")
+        assert _is_draft_layer_name("model.layers.0.self_attn.attn") is False
+
+    def test_mtp_layer_excluded_from_compression(self):
+        """Real machine: 'mtp.layers.0.self_attn.attn' sits in the iterated
+        layer list with an unbound kv_cache - exclude structurally instead of
+        failing per attempt."""
+        runner = FakeRunner().build(num_layers=1, kv_heads=2, head_size=8, num_heads=8,
+                                    block_size=16, max_blocks=256, max_reqs=8)
+        ib = FakeInputBatch(["r0"], [0], [100], 16, 256, 8)
+        runner.input_batch = ib
+        bt = ib.block_table[0]
+        for b in range(7):
+            bt.block_table.np[0, b] = 100 + b
+        bt.num_blocks_per_row[0] = 7
+        # add an MTP layer into group 0's layer list with an unbound kv_cache
+        group0 = runner.kv_cache_config.kv_cache_groups[0]
+        group0.layer_names = ["model.layers.0.self_attn.attn", "mtp.layers.0.self_attn.attn"]
+        no_kv_before = registry.stats_snapshot().get("skipped_no_kv", 0)
+        exc_before = registry.stats_snapshot().get("layers_excluded_draft", 0)
+        mgr = make_mgr()
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        mgr.on_step_end(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        # base layer compressed, MTP layer never scored
+        assert "r0" in mgr.layouts
+        assert "model.layers.0.self_attn.attn" in mgr.layouts["r0"]
+        assert registry.stats_snapshot().get("skipped_no_kv", 0) == no_kv_before
+        assert registry.stats_snapshot().get("layers_excluded_draft", 0) > exc_before
+
+    def test_drafter_attn_layer_names_excluded(self):
+        runner = FakeRunner().build(num_layers=1, kv_heads=2, head_size=8, num_heads=8,
+                                    block_size=16, max_blocks=256, max_reqs=8)
+        ib = FakeInputBatch(["r0"], [0], [100], 16, 256, 8)
+        runner.input_batch = ib
+        bt = ib.block_table[0]
+        for b in range(7):
+            bt.block_table.np[0, b] = 100 + b
+        bt.num_blocks_per_row[0] = 7
+        class _Drafter:
+            attn_layer_names = ["model.layers.0.self_attn.attn"]
+        runner.drafter = _Drafter()
+        mgr = make_mgr()
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        mgr.on_step_end(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        # the only base layer is excluded via the drafter list -> nothing compresses
+        assert "r0" not in mgr.layouts

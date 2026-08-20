@@ -71,7 +71,8 @@ class CaptureManager:
         self._step_counter = 0
         self._active_prefills = 0
         self._completed_total = 0
-        self._compressed_done: set = set()          # req_ids compressed at completion (no re-trigger)
+        self._compressed_done: set = set()
+        self._reported_no_kv: set = set()           # layers already logged as kv_cache-missing          # req_ids compressed at completion (no re-trigger)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -456,7 +457,7 @@ class CaptureManager:
             bs = int(getattr(spec, "block_size", 128) or 128)
             kv_heads = int(getattr(spec, "num_kv_heads", 0) or 0)
             head_size = int(getattr(spec, "head_size", 0) or 0)
-            layer_names = list(group0.layer_names)
+            layer_names = self._compressible_layer_names(runner, list(group0.layer_names))
         except Exception as exc:
             registry.record("skipped_error")
             logger.warning("cannot read kv_cache_spec: %s", exc)
@@ -512,7 +513,7 @@ class CaptureManager:
             bs = int(getattr(spec, "block_size", 128) or 128)
             kv_heads = int(getattr(spec, "num_kv_heads", 0) or 0)
             head_size = int(getattr(spec, "head_size", 0) or 0)
-            layer_names = list(group0.layer_names)
+            layer_names = self._compressible_layer_names(runner, list(group0.layer_names))
         except Exception as exc:
             registry.record("skipped_error")
             logger.warning("cannot read kv_cache_spec: %s", exc)
@@ -547,6 +548,30 @@ class CaptureManager:
             except Exception as exc:  # fail-soft per request
                 registry.record("skipped_error")
                 logger.warning("mid-prefill compress %s failed: %s", req_id, exc)
+
+    def _compressible_layer_names(self, runner, layer_names):
+        """Exclude draft/MTP attention layers from compression.
+
+        Real machine: `mtp.layers.0.self_attn.attn` sits in the iterated
+        layer list but its kv_cache is never bound like the base layers'
+        (step3.5 MTP draft groups). Compressing it is neither needed nor
+        safe; excluding structurally kills the per-attempt warnings.
+        """
+        excluded = set()
+        try:
+            drafter = getattr(runner, "drafter", None)
+            if drafter is not None:
+                excluded.update(getattr(drafter, "attn_layer_names", []) or [])
+        except Exception:
+            pass
+        kept = [ln for ln in layer_names
+                if ln not in excluded and not _is_draft_layer_name(ln)]
+        if len(kept) != len(layer_names):
+            registry.record("layers_excluded_draft")
+            logger.info("excluded %d draft/MTP layer(s) from compression: %s",
+                        len(layer_names) - len(kept),
+                        [ln for ln in layer_names if ln not in kept][:4])
+        return kept
 
     def _num_hidden_layers(self, runner) -> int:
         try:
@@ -669,7 +694,9 @@ class CaptureManager:
                 # `not kc` does NOT catch (None, None) tuples - check entries
                 if kc is None or not kc or kc[0] is None or kc[1] is None:
                     registry.record("skipped_no_kv")
-                    logger.debug("layer %s kv_cache missing - skipped", layer_name)
+                    if layer_name not in self._reported_no_kv:
+                        self._reported_no_kv.add(layer_name)
+                        logger.warning("layer %s kv_cache missing - skipped (reported once)", layer_name)
                     continue
                 key_cache = kc[0]
                 flat = key_cache.view(-1, kv_heads, head_size)
@@ -689,7 +716,8 @@ class CaptureManager:
                 # keep_blocks/block_scores are DEVICE tensors on the real NPU:
                 # never call .numpy() on them directly (raises "can't convert npu
                 # device type tensor to numpy" - real-machine bug); use _as_numpy.
-                bl = _as_numpy(keep_blocks).astype(np.int64)
+                # Sort on numpy, not on device (ArgSort AiCpu fallback).
+                bl = np.sort(_as_numpy(keep_blocks)).astype(np.int64)
                 # The last block must stay visible when partial (new tokens land
                 # in its padding slots). Make room by dropping the lowest-scored
                 # KEPT block when at budget.
@@ -762,7 +790,9 @@ class CaptureManager:
                 # `not kc` does NOT catch (None, None) tuples - check entries
                 if kc is None or not kc or kc[0] is None or kc[1] is None:
                     registry.record("skipped_no_kv")
-                    logger.debug("layer %s kv_cache missing - skipped", layer_name)
+                    if layer_name not in self._reported_no_kv:
+                        self._reported_no_kv.add(layer_name)
+                        logger.warning("layer %s kv_cache missing - skipped (reported once)", layer_name)
                     continue
                 key_cache, value_cache = kc[0], kc[1]
                 kflat = key_cache.view(-1, kv_heads, head_size)
@@ -777,7 +807,9 @@ class CaptureManager:
                 ctx = _layer_ctx(layer_name, num_heads, kv_heads, head_size, num_hidden_layers)
                 scores = press.score(ctx, queries, keys, values, hidden)
                 keep = _token_keep(scores, n_kept)
-                keep_t = torch.as_tensor(keep, device=device) if not torch.is_tensor(keep) else keep
+                # sort on numpy (device ArgSort falls back to AiCpu on Ascend)
+                keep_np = np.sort(_as_numpy(keep)).astype(np.int64)
+                keep_t = torch.from_numpy(keep_np).to(device)
                 kflat[t_slot_t] = keys[keep_t]
                 vflat[t_slot_t] = values[keep_t]
                 registry.record("compressed")
@@ -840,6 +872,14 @@ class CaptureManager:
 # ---------------------------------------------------------------------------
 
 
+def _is_draft_layer_name(layer_name: str) -> bool:
+    """Draft/MTP attention layers (e.g. 'mtp.layers.0.self_attn.attn') are
+    excluded from compression: their KV groups are separate and unbound in the
+    base runner's static_forward_context."""
+    ln = layer_name or ""
+    return ".mtp." in ln or ln.startswith("mtp.") or ".draft." in ln or ln.startswith("draft.")
+
+
 def _attn_state_name(state) -> str:
     if state is None:
         return ""
@@ -892,15 +932,21 @@ def _layer_ctx(layer_name: str, num_heads: int, kv_heads: int, head_size: int,
 
 
 def _block_keep(scores, n_blocks: int, bs: int, n_kept_blocks: int):
-    """Return (block_scores, sorted kept block indices)."""
+    """Return (block_scores, UNSORTED kept block indices).
+
+    Sorting is done by the caller on CPU/numpy: device-side `.sort()` on
+    int64 indices falls back to the AiCpu ArgSort kernel on Ascend (kernel
+    does not support int32/int64 on AiCore - real-machine perf warning).
+    """
     seq = scores.shape[0]
     pad = (-seq) % bs
     if pad:
         scores = torch.nn.functional.pad(scores, (0, pad))
     blocks = scores.view(n_blocks, bs).mean(dim=1)
-    idx = blocks.topk(n_kept_blocks, dim=-1).indices.sort().values
+    idx = blocks.topk(n_kept_blocks, dim=-1).indices
     return blocks, idx
 
 
 def _token_keep(scores, n_kept: int):
-    return scores.topk(n_kept, dim=-1).indices.sort().values
+    """UNSORTED top-k token indices (caller sorts on numpy)."""
+    return scores.topk(n_kept, dim=-1).indices
