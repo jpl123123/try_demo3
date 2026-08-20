@@ -659,48 +659,57 @@ class CaptureManager:
                                device, row, keep_capture=False, kind="completion") -> None:
         per_layer: dict = {}
         for layer_name in layer_names:
-            mod = sfc.get(layer_name)
-            if mod is None:
-                continue
-            kc = getattr(mod, "kv_cache", None)
-            if kc is None or not kc:
-                continue
-            key_cache = kc[0]
-            flat = key_cache.view(-1, kv_heads, head_size)
-            keys = flat[slot_t]  # (orig_len, kvh, hd)
-            qbuf = rc.queries.get(layer_name) if rc else None
-            queries = qbuf[:rc.captured_q.get(layer_name, 0)] if qbuf is not None else None
-            hidden = rc.hidden.get(layer_name) if rc else None
-            if hidden is not None:
-                hidden._attn_module = mod  # for ExpectedAttention/CriticalKV
-            ctx = _layer_ctx(layer_name, num_heads, kv_heads, head_size, num_hidden_layers)
-            scores = press.score(ctx, queries, keys, None, hidden)
-            n_kept_blocks = press.budget_blocks(ctx, orig_len, bs)
-            n_blocks = m
-            if n_kept_blocks >= n_blocks:
-                continue
-            block_scores, keep_blocks = _block_keep(scores, n_blocks, bs, n_kept_blocks)
-            # keep_blocks/block_scores are DEVICE tensors on the real NPU:
-            # never call .numpy() on them directly (raises "can't convert npu
-            # device type tensor to numpy" - real-machine bug); use _as_numpy.
-            bl = _as_numpy(keep_blocks).astype(np.int64)
-            # The last block must stay visible when partial (new tokens land
-            # in its padding slots). Make room by dropping the lowest-scored
-            # KEPT block when at budget.
-            if orig_len % bs != 0 and (m - 1) not in bl.tolist():
-                bscores = _as_numpy(block_scores)
-                drop_idx = int(np.argmin(bscores[bl]))
-                bl = np.delete(bl, drop_idx)
-                bl = np.append(bl, m - 1)
-                bl.sort()
-            kept_ids = row[bl]
-            n_kept = sum(min(bs, orig_len - int(b) * bs) for b in bl.tolist())
-            per_layer[layer_name] = {
-                "kept_ids": kept_ids.astype(np.int64),
-                "n_kept_blocks": int(len(bl)),
-                "n_kept": n_kept,
-            }
-            registry.record("compressed")
+            # per-layer fail-soft: one broken layer (e.g. kv_cache unbound)
+            # must not abort compression for the whole request
+            try:
+                mod = sfc.get(layer_name)
+                if mod is None:
+                    continue
+                kc = getattr(mod, "kv_cache", None)
+                # `not kc` does NOT catch (None, None) tuples - check entries
+                if kc is None or not kc or kc[0] is None or kc[1] is None:
+                    registry.record("skipped_no_kv")
+                    logger.debug("layer %s kv_cache missing - skipped", layer_name)
+                    continue
+                key_cache = kc[0]
+                flat = key_cache.view(-1, kv_heads, head_size)
+                keys = flat[slot_t]  # (orig_len, kvh, hd)
+                qbuf = rc.queries.get(layer_name) if rc else None
+                queries = qbuf[:rc.captured_q.get(layer_name, 0)] if qbuf is not None else None
+                hidden = rc.hidden.get(layer_name) if rc else None
+                if hidden is not None:
+                    hidden._attn_module = mod  # for ExpectedAttention/CriticalKV
+                ctx = _layer_ctx(layer_name, num_heads, kv_heads, head_size, num_hidden_layers)
+                scores = press.score(ctx, queries, keys, None, hidden)
+                n_kept_blocks = press.budget_blocks(ctx, orig_len, bs)
+                n_blocks = m
+                if n_kept_blocks >= n_blocks:
+                    continue
+                block_scores, keep_blocks = _block_keep(scores, n_blocks, bs, n_kept_blocks)
+                # keep_blocks/block_scores are DEVICE tensors on the real NPU:
+                # never call .numpy() on them directly (raises "can't convert npu
+                # device type tensor to numpy" - real-machine bug); use _as_numpy.
+                bl = _as_numpy(keep_blocks).astype(np.int64)
+                # The last block must stay visible when partial (new tokens land
+                # in its padding slots). Make room by dropping the lowest-scored
+                # KEPT block when at budget.
+                if orig_len % bs != 0 and (m - 1) not in bl.tolist():
+                    bscores = _as_numpy(block_scores)
+                    drop_idx = int(np.argmin(bscores[bl]))
+                    bl = np.delete(bl, drop_idx)
+                    bl = np.append(bl, m - 1)
+                    bl.sort()
+                kept_ids = row[bl]
+                n_kept = sum(min(bs, orig_len - int(b) * bs) for b in bl.tolist())
+                per_layer[layer_name] = {
+                    "kept_ids": kept_ids.astype(np.int64),
+                    "n_kept_blocks": int(len(bl)),
+                    "n_kept": n_kept,
+                }
+                registry.record("compressed")
+            except Exception as exc:  # fail-soft per layer
+                registry.record("skipped_error")
+                logger.warning("layer %s scoring failed: %s", layer_name, exc)
         if not per_layer:
             return
         if envs.dry_run():
@@ -744,29 +753,37 @@ class CaptureManager:
         t_slots = np.repeat(rew[: layout.k], bs)[:n_kept] * bs + (target_slots % bs)
         t_slot_t = torch.from_numpy(t_slots.astype(np.int64)).to(device)
         for layer_name in layer_names:
-            mod = sfc.get(layer_name)
-            if mod is None:
-                continue
-            kc = getattr(mod, "kv_cache", None)
-            if kc is None or not kc:
-                continue
-            key_cache, value_cache = kc[0], kc[1]
-            kflat = key_cache.view(-1, kv_heads, head_size)
-            vflat = value_cache.view(-1, kv_heads, head_size)
-            keys = kflat[slot_t]
-            values = vflat[slot_t]
-            qbuf = rc.queries.get(layer_name) if rc else None
-            queries = qbuf[:rc.captured_q.get(layer_name, 0)] if qbuf is not None else None
-            hidden = rc.hidden.get(layer_name) if rc else None
-            if hidden is not None:
-                hidden._attn_module = mod
-            ctx = _layer_ctx(layer_name, num_heads, kv_heads, head_size, num_hidden_layers)
-            scores = press.score(ctx, queries, keys, values, hidden)
-            keep = _token_keep(scores, n_kept)
-            keep_t = torch.as_tensor(keep, device=device) if not torch.is_tensor(keep) else keep
-            kflat[t_slot_t] = keys[keep_t]
-            vflat[t_slot_t] = values[keep_t]
-            registry.record("compressed")
+            # per-layer fail-soft: one broken layer must not abort the request
+            try:
+                mod = sfc.get(layer_name)
+                if mod is None:
+                    continue
+                kc = getattr(mod, "kv_cache", None)
+                # `not kc` does NOT catch (None, None) tuples - check entries
+                if kc is None or not kc or kc[0] is None or kc[1] is None:
+                    registry.record("skipped_no_kv")
+                    logger.debug("layer %s kv_cache missing - skipped", layer_name)
+                    continue
+                key_cache, value_cache = kc[0], kc[1]
+                kflat = key_cache.view(-1, kv_heads, head_size)
+                vflat = value_cache.view(-1, kv_heads, head_size)
+                keys = kflat[slot_t]
+                values = vflat[slot_t]
+                qbuf = rc.queries.get(layer_name) if rc else None
+                queries = qbuf[:rc.captured_q.get(layer_name, 0)] if qbuf is not None else None
+                hidden = rc.hidden.get(layer_name) if rc else None
+                if hidden is not None:
+                    hidden._attn_module = mod
+                ctx = _layer_ctx(layer_name, num_heads, kv_heads, head_size, num_hidden_layers)
+                scores = press.score(ctx, queries, keys, values, hidden)
+                keep = _token_keep(scores, n_kept)
+                keep_t = torch.as_tensor(keep, device=device) if not torch.is_tensor(keep) else keep
+                kflat[t_slot_t] = keys[keep_t]
+                vflat[t_slot_t] = values[keep_t]
+                registry.record("compressed")
+            except Exception as exc:  # fail-soft per layer
+                registry.record("skipped_error")
+                logger.warning("layer %s compact failed: %s", layer_name, exc)
         self.compact[req_id] = layout
         self.requests.pop(req_id, None)
         logger.debug("req %s compacted: orig=%d kept=%d k=%d slack=%d",

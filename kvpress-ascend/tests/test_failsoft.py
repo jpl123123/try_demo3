@@ -55,6 +55,28 @@ class TestFailSoft:
         assert registry.stats_snapshot().get("compressed", 0) >= before + 1
         assert "r0" in mgr.layouts
 
+    def test_none_tuple_kv_cache_skips_layer(self):
+        """(None, None) kv_cache tuples are NOT caught by `not kc` - the guard
+        must check entries (real machine: 'NoneType' object has no attribute
+        'shape' in the scorer). Other layers must still compress."""
+        runner = FakeRunner().build(num_layers=2, kv_heads=2, head_size=8, num_heads=8,
+                                    block_size=16, max_blocks=256, max_reqs=8)
+        ib = FakeInputBatch(["r0"], [0], [100], 16, 256, 8)
+        runner.input_batch = ib
+        bt = ib.block_table[0]
+        for b in range(7):
+            bt.block_table.np[0, b] = 100 + b
+        bt.num_blocks_per_row[0] = 7
+        mod0 = runner.compilation_config.static_forward_context["model.layers.0.self_attn.attn"]
+        mod0.kv_cache = (None, None)  # the exact real-machine failure shape
+        mgr = make_mgr()
+        before = registry.stats_snapshot().get("compressed", 0)
+        mgr.on_step_begin(runner, FakeSchedulerOutput({"r0": 100}, 0))
+        mgr.on_step_end(runner, FakeSchedulerOutput({"r0": 100}, 0))  # must not raise
+        assert registry.stats_snapshot().get("compressed", 0) >= before + 1  # layer 1 still done
+        assert registry.stats_snapshot().get("skipped_no_kv", 0) >= 1
+        assert "r0" in mgr.layouts
+
     def test_missing_static_forward_context_no_crash(self):
         runner = FakeRunner().build(num_layers=2, kv_heads=2, head_size=8, num_heads=8,
                                     block_size=16, max_blocks=256, max_reqs=8)
